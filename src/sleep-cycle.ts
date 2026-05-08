@@ -245,7 +245,8 @@ export class SleepCycleEngine {
 
   // ─── Phase 1: Scoring ──────────────────────────────────────────────────────
 
-  private async phaseScoring(agentId: string): Promise<number> {
+  // VARIANT: visibility promoted from private → protected for src/research/ subclasses
+  protected async phaseScoring(agentId: string): Promise<number> {
     // Load per-agent weights if available, fall back to global defaults
     const agentWeights = await this.pool.query<{ scoring_weights: Record<string, number> | null }>(
       `SELECT scoring_weights FROM agents WHERE id = $1`, [agentId],
@@ -303,7 +304,8 @@ export class SleepCycleEngine {
 
   // ─── Phase 2: Triage ───────────────────────────────────────────────────────
 
-  private async phaseTriage(agentId: string): Promise<{ evicted: number; flaggedIds: bigint[] }> {
+  // VARIANT: visibility promoted from private → protected for src/research/ subclasses
+  protected async phaseTriage(agentId: string): Promise<{ evicted: number; flaggedIds: bigint[] }> {
     // Graduate high-confidence memories — inspired by claude-code-toolkit (MIT)
     await this.pool.query(
       `UPDATE warm_tier SET graduated = true
@@ -362,7 +364,8 @@ export class SleepCycleEngine {
 
   // ─── Phase 3: Revision ─────────────────────────────────────────────────────
 
-  private async reviseMemory(agentId: string, warmTierId: bigint): Promise<number> {
+  // VARIANT: visibility promoted from private → protected for src/research/ subclasses
+  protected async reviseMemory(agentId: string, warmTierId: bigint): Promise<number> {
     // Gather the memory and its context
     const memory = await this.pool.query<{ content: string; metadata: Record<string, unknown>; importance: number }>(
       `SELECT content, metadata, importance FROM warm_tier WHERE id = $1 AND agent_id = $2`,

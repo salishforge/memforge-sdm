@@ -376,7 +376,8 @@ export class MemoryManager {
    * Activated by ENABLE_LLM_RERANK=true. Sends top results + question to LLM
    * for relevance-based reordering. Adds ~2K tokens per query.
    */
-  private async rerankWithLlm(question: string, results: QueryResult[]): Promise<QueryResult[]> {
+  // VARIANT: visibility promoted from private → protected for src/research/ subclasses
+  protected async rerankWithLlm(question: string, results: QueryResult[]): Promise<QueryResult[]> {
     if (!this.llm || results.length <= 1) return results;
 
     const numbered = results
@@ -787,7 +788,8 @@ Ranking (numbers only):`;
 
   // ─── Hybrid search (reciprocal rank fusion) ───────────────────────────────
 
-  private async queryHybrid(
+  // VARIANT: visibility promoted from private → protected for src/research/ subclasses
+  protected async queryHybrid(
     agentId: string,
     searchText: string,
     limit: number,
@@ -1938,6 +1940,18 @@ Ranking (numbers only):`;
 
   // ─── Sleep Cycle ──────────────────────────────────────────────────────────
 
+  // VARIANT: factory method for src/research/ subclasses to swap in a custom
+  // SleepCycleEngine. Default implementation matches prior inline construction.
+  protected createSleepEngine(
+    pool: import('pg').Pool,
+    llm: LLMProvider,
+    embedder: EmbeddingProvider,
+    cycleConfig: SleepCycleConfig,
+    audit: AuditChain | null,
+  ): SleepCycleEngine {
+    return new SleepCycleEngine(pool, llm, embedder, cycleConfig, audit);
+  }
+
   /**
    * Execute a sleep cycle — background processing that scores, triages,
    * revises, and maintains the knowledge base.
@@ -1971,7 +1985,8 @@ Ranking (numbers only):`;
       weights: { ...this.config.sleepCycle.weights, ...safeOverrides.weights },
     };
 
-    const engine = new SleepCycleEngine(this.pool, revisionLlm, this.embedder, cycleConfig, this.audit);
+    // VARIANT: dispatch through factory so src/research/ subclasses can swap engines
+    const engine = this.createSleepEngine(this.pool, revisionLlm, this.embedder, cycleConfig, this.audit);
 
     const promise = engine.run(agentId);
     this.sleepLocks.set(agentId, promise);

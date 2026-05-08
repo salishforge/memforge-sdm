@@ -1,0 +1,128 @@
+// MemForge — Research-variant standalone server
+//
+// Mirrors src/server.ts but wires `ResearchMemoryManager` (which in turn
+// wires `ResearchSleepCycleEngine`) through createApp(). Use this entrypoint
+// to run the SDM research variant alongside the upstream server for
+// head-to-head benchmarking.
+//
+// Defaults:
+//   PORT=3334            (vs. upstream default 3333 — coexist on one host)
+//   LOG_LEVEL inherited
+//   all other env vars identical to src/server.ts
+//
+// Run:
+//   tsx src/research/research-server.ts
+//
+// See /root/.claude/plans/continue-the-research-on-merry-rabbit.md.
+
+import { ResearchMemoryManager } from './research-memory-manager.js';
+import { createEmbeddingProvider } from '../embedding.js';
+import { createLLMProvider } from '../llm.js';
+import { closePool, getPool } from '../db.js';
+import { closeRedis } from '../cache.js';
+import { createDefaultRegistry } from '../classifier.js';
+import { wrapLLMProvider } from '../llm-safety.js';
+import { AuditChain } from '../audit.js';
+import { createApp } from '../app.js';
+import { getLogger } from '../logger.js';
+import { configureWebhooks } from '../webhooks.js';
+import type { ConsolidationMode } from '../types.js';
+
+const log = getLogger('research-server');
+
+const PORT = parseInt(process.env['PORT'] ?? '3334', 10);
+const ADMIN_TOKEN = process.env['ADMIN_TOKEN'] ?? '';
+
+const classifierRegistry = createDefaultRegistry();
+const embeddingProvider = createEmbeddingProvider();
+
+const llmProviderType = process.env['LLM_PROVIDER'] ?? 'none';
+const allowRemoteLLM = process.env['ALLOW_REMOTE_LLM'] === 'true';
+const rawLlmProvider = createLLMProvider();
+const llmProvider = wrapLLMProvider(rawLlmProvider, llmProviderType, classifierRegistry, allowRemoteLLM);
+
+const revisionProviderType = process.env['REVISION_LLM_PROVIDER'] ?? llmProviderType;
+const rawRevisionLlmProvider = process.env['REVISION_LLM_PROVIDER']
+  ? createLLMProvider(process.env['REVISION_LLM_PROVIDER'] as 'anthropic' | 'openai' | 'ollama')
+  : null;
+const revisionLlmProvider = wrapLLMProvider(
+  rawRevisionLlmProvider,
+  revisionProviderType,
+  classifierRegistry,
+  allowRemoteLLM,
+);
+
+const auditChain = new AuditChain(getPool(process.env['DATABASE_URL'] || undefined), {
+  hmacKey: process.env['AUDIT_HMAC_KEY'],
+  retentionDays: parseInt(process.env['AUDIT_RETENTION_DAYS'] ?? '90', 10),
+  archiveOnExpiry: process.env['AUDIT_ARCHIVE_ON_EXPIRY'] !== 'false',
+});
+
+const manager = new ResearchMemoryManager({
+  databaseUrl: process.env['DATABASE_URL'],
+  consolidationBatchSize: parseInt(process.env['CONSOLIDATION_BATCH_SIZE'] ?? '500', 10),
+  consolidationThreshold: parseInt(process.env['CONSOLIDATION_THRESHOLD'] ?? '50', 10),
+  autoRegisterAgents: process.env['AUTO_REGISTER_AGENTS'] !== 'false',
+  embeddingProvider,
+  llmProvider,
+  revisionLlmProvider,
+  consolidationMode: (process.env['CONSOLIDATION_MODE'] as ConsolidationMode) ?? 'concat',
+  temporalDecayRate: parseFloat(process.env['TEMPORAL_DECAY_RATE'] ?? '0'),
+  consolidationInnerBatchSize: parseInt(process.env['CONSOLIDATION_INNER_BATCH_SIZE'] ?? '50', 10),
+  keywordOverlapBoost: parseFloat(process.env['KEYWORD_OVERLAP_BOOST'] ?? '0.3'),
+  temporalProximityDays: parseFloat(process.env['TEMPORAL_PROXIMITY_DAYS'] ?? '7'),
+  enableLlmRerank: process.env['ENABLE_LLM_RERANK'] === 'true',
+  enableLlmIngest: process.env['ENABLE_LLM_INGEST'] === 'true',
+  sleepCycle: {
+    tokenBudget: parseInt(process.env['SLEEP_CYCLE_TOKEN_BUDGET'] ?? '100000', 10),
+    evictionThreshold: parseFloat(process.env['SLEEP_CYCLE_EVICTION_THRESHOLD'] ?? '0.1'),
+    revisionThreshold: parseFloat(process.env['SLEEP_CYCLE_REVISION_THRESHOLD'] ?? '0.4'),
+    includeReflection: process.env['SLEEP_CYCLE_INCLUDE_REFLECTION'] !== 'false',
+    coldRetentionDays: process.env['COLD_TIER_RETENTION_DAYS']
+      ? Math.max(1, parseInt(process.env['COLD_TIER_RETENTION_DAYS'], 10))
+      : undefined,
+    weights: { recency: 0.25, frequency: 0.20, centrality: 0.20, reflection: 0.15, stability: 0.20 },
+  },
+  auditChain,
+});
+
+configureWebhooks();
+
+const app = createApp({
+  manager,
+  auditChain,
+  classifierRegistry,
+  adminToken: ADMIN_TOKEN,
+  rateLimitWindowMs: parseInt(process.env['RATE_LIMIT_WINDOW_MS'] ?? '60000', 10),
+  rateLimitMax: parseInt(process.env['RATE_LIMIT_MAX'] ?? '100', 10),
+  port: PORT,
+  corsOrigin: process.env['CORS_ORIGIN'],
+  corsMethods: process.env['CORS_METHODS'],
+  corsHeaders: process.env['CORS_HEADERS'],
+});
+
+const server = app.listen(PORT, () => {
+  log.info(
+    {
+      port: PORT,
+      variant: 'sdm-research',
+      embeddings: manager.embeddingsEnabled,
+      summarization: manager.summarizationEnabled,
+    },
+    'research server started',
+  );
+});
+
+async function shutdown(signal: string): Promise<void> {
+  log.info({ signal }, 'shutting down research server');
+  server.close(async () => {
+    await Promise.all([closePool(), closeRedis()]);
+    process.exit(0);
+  });
+  setTimeout(() => process.exit(1), 10_000).unref();
+}
+
+process.on('SIGTERM', () => void shutdown('SIGTERM'));
+process.on('SIGINT', () => void shutdown('SIGINT'));
+
+export { app };
