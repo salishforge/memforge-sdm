@@ -1,5 +1,13 @@
 -- MemForge Standalone — PostgreSQL Schema
 -- Five-table design: hot_tier, warm_tier, cold_tier, consolidation_log, agents
+--
+-- This is the canonical "from scratch" schema. It is kept in sync with
+-- schema/migration-v*.sql files. Apply this once for new installations:
+--   psql "$DATABASE_URL" -f schema/schema.sql
+--
+-- Row-Level Security policies and the memforge_app role are NOT included
+-- here — apply schema/migration-v2.3.sql separately for production
+-- deployments that need agent-isolation RLS.
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- Extensions
@@ -11,10 +19,15 @@ CREATE EXTENSION IF NOT EXISTS vector;
 -- agents — registry of all known agents (multi-tenant anchor)
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS agents (
-  id           TEXT        PRIMARY KEY,
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
-  last_seen    TIMESTAMPTZ NOT NULL DEFAULT now(),
-  metadata     JSONB       NOT NULL DEFAULT '{}'
+  id                         TEXT        PRIMARY KEY,
+  created_at                 TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen                  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  metadata                   JSONB       NOT NULL DEFAULT '{}',
+  -- Sleep cycle tracking (v2.4)
+  last_sleep_cycle           TIMESTAMPTZ,
+  sleep_cycle_cost_tokens    BIGINT      NOT NULL DEFAULT 0,
+  -- Per-agent autonomously-tuned scoring weights (v2.4)
+  scoring_weights            JSONB
 );
 
 -- ─────────────────────────────────────────────────────────────────────────────
@@ -25,11 +38,14 @@ CREATE TABLE IF NOT EXISTS hot_tier (
   agent_id     TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   content      TEXT        NOT NULL,
   metadata     JSONB       NOT NULL DEFAULT '{}',
-  created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- SHA-256 of content used for ingest dedup (v2.4)
+  content_hash TEXT
 );
 
-CREATE INDEX IF NOT EXISTS hot_tier_agent_id_idx   ON hot_tier (agent_id);
-CREATE INDEX IF NOT EXISTS hot_tier_created_at_idx ON hot_tier (created_at DESC);
+CREATE INDEX IF NOT EXISTS hot_tier_agent_id_idx       ON hot_tier (agent_id);
+CREATE INDEX IF NOT EXISTS hot_tier_created_at_idx     ON hot_tier (created_at DESC);
+CREATE INDEX IF NOT EXISTS hot_tier_content_hash_idx   ON hot_tier (agent_id, content_hash);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- warm_tier — consolidated, full-text-searchable memory with embeddings
@@ -39,10 +55,14 @@ CREATE TABLE IF NOT EXISTS warm_tier (
   agent_id            TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
   content             TEXT        NOT NULL,
   content_tsv         TSVECTOR    GENERATED ALWAYS AS (to_tsvector('english', content)) STORED,
+  -- Code-preserving FTS column with simple tokenizer (v2.4)
+  content_code_tsv    TSVECTOR    GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
   embedding           vector,     -- pgvector column, dimensions set by provider
   source_hot_ids      BIGINT[]    NOT NULL DEFAULT '{}',
   metadata            JSONB       NOT NULL DEFAULT '{}',
   consolidated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Hierarchical summary (v2.5) — populated during LLM-mode consolidation
+  summary             TEXT,
   -- Temporal bounds of the source events in this consolidated row
   time_start          TIMESTAMPTZ,
   time_end            TIMESTAMPTZ,
@@ -52,15 +72,25 @@ CREATE TABLE IF NOT EXISTS warm_tier (
   -- Composite scoring for importance-based ranking and eviction
   importance          REAL        NOT NULL DEFAULT 0.5,
   confidence          REAL        NOT NULL DEFAULT 0.5,
-  revision_count      INT         NOT NULL DEFAULT 0
+  revision_count      INT         NOT NULL DEFAULT 0,
+  -- Audit chain content hash (v2.2) — HMAC-SHA256 of content for tamper detection
+  content_hash        TEXT        NOT NULL DEFAULT '',
+  -- Outcome tagging (v2.4) — used by sleep-cycle scoring multiplier
+  outcome_type        TEXT        NOT NULL DEFAULT 'neutral'
+                                    CHECK (outcome_type IN ('error', 'success', 'decision', 'observation', 'neutral')),
+  -- Confidence graduation (v2.4) — high-confidence memories are protected from eviction
+  graduated                   BOOLEAN     NOT NULL DEFAULT false,
+  retrieval_success_count     INT         NOT NULL DEFAULT 0,
+  first_successful_retrieval  TIMESTAMPTZ
 );
 
-CREATE INDEX IF NOT EXISTS warm_tier_agent_id_idx ON warm_tier (agent_id);
-CREATE INDEX IF NOT EXISTS warm_tier_tsv_idx      ON warm_tier USING GIN (content_tsv);
-CREATE INDEX IF NOT EXISTS warm_tier_hot_ids_idx  ON warm_tier USING GIN (source_hot_ids);
-CREATE INDEX IF NOT EXISTS warm_tier_embedding_idx ON warm_tier USING hnsw (embedding vector_cosine_ops);
-CREATE INDEX IF NOT EXISTS warm_tier_time_idx       ON warm_tier (agent_id, time_start, time_end);
-CREATE INDEX IF NOT EXISTS warm_tier_importance_idx ON warm_tier (agent_id, importance DESC);
+CREATE INDEX IF NOT EXISTS warm_tier_agent_id_idx    ON warm_tier (agent_id);
+CREATE INDEX IF NOT EXISTS warm_tier_tsv_idx         ON warm_tier USING GIN (content_tsv);
+CREATE INDEX IF NOT EXISTS warm_tier_code_tsv_idx    ON warm_tier USING GIN (content_code_tsv);
+CREATE INDEX IF NOT EXISTS warm_tier_hot_ids_idx     ON warm_tier USING GIN (source_hot_ids);
+CREATE INDEX IF NOT EXISTS warm_tier_embedding_idx   ON warm_tier USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX IF NOT EXISTS warm_tier_time_idx        ON warm_tier (agent_id, time_start, time_end);
+CREATE INDEX IF NOT EXISTS warm_tier_importance_idx  ON warm_tier (agent_id, importance DESC);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- cold_tier — archived / cleared memory (audit trail, never hard-deleted)
@@ -155,38 +185,47 @@ CREATE INDEX IF NOT EXISTS warm_tier_entities_entity_idx ON warm_tier_entities (
 -- reflections — synthesized insights from periodic LLM review
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS reflections (
-  id              BIGSERIAL   PRIMARY KEY,
-  agent_id        TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-  content         TEXT        NOT NULL,
-  key_insights    TEXT[]      NOT NULL DEFAULT '{}',
-  contradictions  TEXT[]      NOT NULL DEFAULT '{}',
-  source_warm_ids BIGINT[]    NOT NULL DEFAULT '{}',
-  trigger_type    TEXT        NOT NULL DEFAULT 'manual'
-                                CHECK (trigger_type IN ('manual', 'threshold', 'scheduled')),
-  metadata        JSONB       NOT NULL DEFAULT '{}',
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  id                    BIGSERIAL   PRIMARY KEY,
+  agent_id              TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  content               TEXT        NOT NULL,
+  key_insights          TEXT[]      NOT NULL DEFAULT '{}',
+  contradictions        TEXT[]      NOT NULL DEFAULT '{}',
+  source_warm_ids       BIGINT[]    NOT NULL DEFAULT '{}',
+  trigger_type          TEXT        NOT NULL DEFAULT 'manual'
+                                      CHECK (trigger_type IN ('manual', 'threshold', 'scheduled')),
+  metadata              JSONB       NOT NULL DEFAULT '{}',
+  created_at            TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Meta-reflection: hierarchy of reflections-over-reflections (v2.1)
+  reflection_level      INT         NOT NULL DEFAULT 1,
+  source_reflection_ids BIGINT[]    NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS reflections_agent_id_idx  ON reflections (agent_id);
 CREATE INDEX IF NOT EXISTS reflections_created_idx   ON reflections (created_at DESC);
+CREATE INDEX IF NOT EXISTS reflections_level_idx     ON reflections (agent_id, reflection_level);
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- retrieval_log — records every query hit for reinforcement analysis
 -- ─────────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS retrieval_log (
-  id              BIGSERIAL   PRIMARY KEY,
-  agent_id        TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-  warm_tier_id    BIGINT      NOT NULL REFERENCES warm_tier(id) ON DELETE CASCADE,
-  query_text      TEXT        NOT NULL,
-  query_mode      TEXT        NOT NULL DEFAULT 'keyword',
-  rank_position   INT         NOT NULL DEFAULT 0,
-  metadata        JSONB       NOT NULL DEFAULT '{}',
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+  id                  BIGSERIAL   PRIMARY KEY,
+  agent_id            TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  warm_tier_id        BIGINT      NOT NULL REFERENCES warm_tier(id) ON DELETE CASCADE,
+  query_text          TEXT        NOT NULL,
+  query_mode          TEXT        NOT NULL DEFAULT 'keyword',
+  rank_position       INT         NOT NULL DEFAULT 0,
+  metadata            JSONB       NOT NULL DEFAULT '{}',
+  created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Outcome feedback (v2.1) — fed back from downstream task success/failure
+  outcome             TEXT        CHECK (outcome IN ('positive', 'negative', 'neutral')),
+  feedback_at         TIMESTAMPTZ,
+  feedback_metadata   JSONB       NOT NULL DEFAULT '{}'
 );
 
 CREATE INDEX IF NOT EXISTS retrieval_log_agent_idx   ON retrieval_log (agent_id);
 CREATE INDEX IF NOT EXISTS retrieval_log_warm_idx    ON retrieval_log (warm_tier_id);
 CREATE INDEX IF NOT EXISTS retrieval_log_created_idx ON retrieval_log (created_at DESC);
+CREATE INDEX IF NOT EXISTS retrieval_log_outcome_idx ON retrieval_log (agent_id, outcome) WHERE outcome IS NOT NULL;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- memory_revisions — tracks every rewrite of a warm-tier memory
@@ -228,3 +267,62 @@ CREATE TABLE IF NOT EXISTS procedures (
 
 CREATE INDEX IF NOT EXISTS procedures_agent_idx  ON procedures (agent_id);
 CREATE INDEX IF NOT EXISTS procedures_active_idx ON procedures (agent_id, active) WHERE active = true;
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- audit_chain — immutable, hash-chained log of warm-tier mutations (v2.2)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS audit_chain (
+  id              BIGSERIAL   PRIMARY KEY,
+  agent_id        TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+
+  -- What was changed
+  target_table    TEXT        NOT NULL CHECK (target_table IN ('warm_tier', 'entities', 'relationships', 'reflections', 'procedures')),
+  target_id       BIGINT      NOT NULL,
+
+  -- Temporal: when this version was valid
+  operation       TEXT        NOT NULL CHECK (operation IN ('create', 'update', 'delete', 'revise', 'merge', 'evict', 'score', 'feedback')),
+  valid_from      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  valid_until     TIMESTAMPTZ,  -- NULL = current version
+
+  -- Content snapshot
+  content_before  TEXT,          -- NULL on create
+  content_after   TEXT,          -- NULL on delete
+  metadata_delta  JSONB       NOT NULL DEFAULT '{}',
+
+  -- Integrity chain
+  content_hash    TEXT        NOT NULL,
+  previous_hash   TEXT        NOT NULL DEFAULT '',
+  chain_hash      TEXT        NOT NULL,
+
+  -- Context
+  triggered_by    TEXT        NOT NULL DEFAULT 'api',
+  model_used      TEXT,
+
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS audit_chain_agent_idx    ON audit_chain (agent_id);
+CREATE INDEX IF NOT EXISTS audit_chain_target_idx   ON audit_chain (target_table, target_id);
+CREATE INDEX IF NOT EXISTS audit_chain_created_idx  ON audit_chain (created_at DESC);
+CREATE INDEX IF NOT EXISTS audit_chain_valid_idx    ON audit_chain (valid_from, valid_until);
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- cold_audit — archived audit records past retention (v2.2)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS cold_audit (
+  id                  BIGSERIAL   PRIMARY KEY,
+  agent_id            TEXT        NOT NULL,
+  target_table        TEXT        NOT NULL,
+  target_id           BIGINT      NOT NULL,
+  operation           TEXT        NOT NULL,
+  valid_from          TIMESTAMPTZ NOT NULL,
+  valid_until         TIMESTAMPTZ,
+  content_hash        TEXT        NOT NULL,
+  chain_hash          TEXT        NOT NULL,
+  triggered_by        TEXT        NOT NULL,
+  archived_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  original_created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS cold_audit_agent_idx  ON cold_audit (agent_id);
+CREATE INDEX IF NOT EXISTS cold_audit_target_idx ON cold_audit (target_table, target_id);
